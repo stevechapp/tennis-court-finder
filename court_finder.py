@@ -8,6 +8,7 @@ Examples:
   py court_finder.py --debug highbury        dump raw data for one venue
   py court_finder.py --html                  open a week-ahead page in your browser
   py court_finder.py --serve                 live page with refresh + date controls
+  py court_finder.py --publish               fetch, then push the page to GitHub Pages
 
 Better login: if Better refuses anonymous requests, paste your bearer token
 (the long string after "Bearer " in DevTools) into better_token.txt next to
@@ -17,6 +18,7 @@ when the script says so.
 import argparse
 import json
 import os
+import subprocess
 import webbrowser
 import sys
 import threading
@@ -293,6 +295,7 @@ def build_data(venues, start, end, slots, lines, notes):
 
     data = {
         "generated": datetime.now().strftime("%A %d %B, %H:%M"),
+        "generated_ts": int(time.time() * 1000),
         "hours": list(range(h_from, h_to + 1)),
         "areas": AREA_NAMES,
         "venues": [{"name": v["name"], "areas": v["areas"]} for v in venues],
@@ -314,6 +317,60 @@ def write_html(venues, start, end, slots, lines, notes, out=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_page(build_data(venues, start, end, slots, lines, notes)), encoding="utf-8")
     return path
+
+
+# ================================================================ publish
+SITE_DIR = Path(__file__).with_name("site")
+LOG_FILE = Path(__file__).with_name("publish.log")
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0   # stop git flashing console windows
+
+
+def log(msg):
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}"
+    print(line)
+    try:
+        old = LOG_FILE.read_text(encoding="utf-8").splitlines()[-300:] if LOG_FILE.exists() else []
+        LOG_FILE.write_text("\n".join(old + [line]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def git(*args, cwd, check=True):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+                       creationflags=NO_WINDOW)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip()
+
+
+def publish(n_days=7):
+    """Build the page and force-push it as a single commit to the gh-pages branch."""
+    here = Path(__file__).parent
+    try:
+        remote = git("remote", "get-url", "origin", cwd=here)
+        start = date.today()
+        end = start + timedelta(days=n_days - 1)
+        slots, notes = collect(VENUES, start, end)
+        lines = group_runs(merge_runs(slots))
+        write_html(VENUES, start, end, slots, lines, notes, SITE_DIR / "index.html")
+        (SITE_DIR / ".nojekyll").touch()
+
+        if not (SITE_DIR / ".git").exists():
+            git("init", "-q", cwd=SITE_DIR)
+        # fresh single-commit branch each time, so history never piles up
+        git("checkout", "-q", "--orphan", "_publish", cwd=SITE_DIR)
+        git("add", "-A", cwd=SITE_DIR)
+        git("commit", "-q", "-m", f"Courts {datetime.now():%a %d %b %H:%M}", cwd=SITE_DIR)
+        git("branch", "-D", "gh-pages", cwd=SITE_DIR, check=False)
+        git("branch", "-m", "gh-pages", cwd=SITE_DIR)
+        git("push", "-q", "-f", remote, "gh-pages", cwd=SITE_DIR)
+        git("reflog", "expire", "--expire=now", "--all", cwd=SITE_DIR, check=False)
+        git("gc", "-q", "--prune=now", cwd=SITE_DIR, check=False)
+
+        log(f"published {len(lines)} runs" + (f"; {len(notes)} notes: " + " | ".join(notes) if notes else ""))
+    except Exception as e:
+        log(f"FAILED: {e}")
+        sys.exit(1)
 
 
 # ================================================================ live server
@@ -416,6 +473,7 @@ body{margin:0;background:var(--bg);color:var(--ink);
 header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:16px 32px;margin-bottom:22px}
 h1{font:700 44px/1 "Barlow Condensed", "Arial Narrow", sans-serif;margin:0;letter-spacing:-.01em}
 .generated{color:var(--muted);font-size:14px;margin:6px 0 0}
+.generated.stale{color:#B5462F;font-weight:600}
 .controls{display:flex;flex-wrap:wrap;gap:14px}
 .seg{display:inline-flex;border:1.5px solid var(--ink);border-radius:999px;overflow:hidden}
 .seg button{font:500 15px/1 Barlow, sans-serif;color:var(--ink);background:transparent;border:0;
@@ -606,8 +664,28 @@ function render() {
   }
 }
 
+function ago(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return m + " min ago";
+  const h = Math.floor(m / 60);
+  return h < 24 ? h + (h === 1 ? " hour ago" : " hours ago") : Math.floor(h / 24) + " days ago";
+}
+
+function showAge() {
+  if (!D) return;
+  const el = $("generated");
+  if (!D.generated_ts) { el.textContent = "Checked " + D.generated; return; }
+  const age = Date.now() - D.generated_ts;
+  const stale = !LIVE && age > 90 * 60000;
+  el.textContent = `Checked ${D.generated} (${ago(age)})` +
+    (stale ? ". This may be out of date, so check the booking site before you go." : "");
+  el.classList.toggle("stale", stale);
+}
+setInterval(showAge, 60000);
+
 function showMeta() {
-  $("generated").textContent = "Checked " + D.generated;
+  showAge();
   $("notes").innerHTML = D.notes.map(n => `<p>${esc(n)}</p>`).join("");
 }
 
@@ -735,11 +813,14 @@ def main():
     p.add_argument("--no-open", action="store_true", help="with --html, don't open the browser")
     p.add_argument("--serve", action="store_true", help="run the live page on this computer")
     p.add_argument("--port", type=int, default=8000, help="port for --serve (default 8000)")
+    p.add_argument("--publish", action="store_true", help="fetch and push the page to GitHub Pages")
     args = p.parse_args()
 
     days = args.days or (7 if args.html else 1)
     start, end = args.start, args.start + timedelta(days=days - 1)
     after, before = parse_hhmm(args.after), parse_hhmm(args.before)
+    if args.publish:
+        return publish(args.days or 7)
     if args.serve:
         return serve(args.port)
 
