@@ -7,6 +7,7 @@ Examples:
   py court_finder.py --area irene --min 90   near Irene's, 90+ min runs
   py court_finder.py --debug highbury        dump raw data for one venue
   py court_finder.py --html                  open a week-ahead page in your browser
+  py court_finder.py --serve                 live page with refresh + date controls
 
 Better login: if Better refuses anonymous requests, paste your bearer token
 (the long string after "Bearer " in DevTools) into better_token.txt next to
@@ -18,7 +19,10 @@ import json
 import os
 import webbrowser
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -262,7 +266,7 @@ def merge_runs(slots):
 
 
 # ================================================================ HTML page
-def write_html(venues, start, end, slots, lines, notes):
+def build_data(venues, start, end, slots, lines, notes):
     hours_seen = [s.start // 60 for s in slots]
     h_from = min(hours_seen + [7])
     h_to = max(hours_seen + [21])
@@ -292,13 +296,94 @@ def write_html(venues, start, end, slots, lines, notes):
         "hours": list(range(h_from, h_to + 1)),
         "areas": AREA_NAMES,
         "venues": [{"name": v["name"], "areas": v["areas"]} for v in venues],
+        "start": start.isoformat(),
         "days": days,
         "notes": notes,
     }
+    return data
+
+
+def render_page(data=None, live=False):
     payload = json.dumps(data).replace("</", "<\\/")
-    path = Path(__file__).with_name("courts.html")
-    path.write_text(HTML_TEMPLATE.replace("__DATA__", payload), encoding="utf-8")
+    return (HTML_TEMPLATE.replace("__DATA__", payload)
+            .replace("__LIVE__", "true" if live else "false"))
+
+
+def write_html(venues, start, end, slots, lines, notes, out=None):
+    path = Path(out) if out else Path(__file__).with_name("courts.html")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_page(build_data(venues, start, end, slots, lines, notes)), encoding="utf-8")
     return path
+
+
+# ================================================================ live server
+CACHE_SECONDS = 120          # reuse results for 2 min unless Refresh is pressed
+_cache, _cache_lock = {}, threading.Lock()
+
+
+def live_data(start, n_days, fresh=False):
+    key = (start, n_days)
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and not fresh and time.time() - hit[0] < CACHE_SECONDS:
+            return hit[1]
+    end = start + timedelta(days=n_days - 1)
+    slots, notes = collect(VENUES, start, end)
+    lines = group_runs(merge_runs(slots))
+    data = build_data(VENUES, start, end, slots, lines, notes)
+    with _cache_lock:
+        _cache[key] = (time.time(), data)
+    return data
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        if url.path == "/":
+            return self._send(200, render_page(None, live=True), "text/html; charset=utf-8")
+        if url.path == "/api/data":
+            q = parse_qs(url.query)
+            try:
+                start = date.fromisoformat(q.get("start", [date.today().isoformat()])[0])
+                n_days = max(1, min(14, int(q.get("days", ["7"])[0])))
+            except ValueError:
+                return self._send(400, json.dumps({"error": "Bad start date or days"}), "application/json")
+            start = max(start, date.today())
+            t0 = time.time()
+            data = live_data(start, n_days, fresh=q.get("fresh") == ["1"])
+            print(f"  {datetime.now():%H:%M:%S}  {start:%a %d %b} +{n_days}d  ({time.time() - t0:.1f}s)")
+            return self._send(200, json.dumps(data), "application/json")
+        self._send(404, "Not found", "text/plain")
+
+    def log_message(self, *args):
+        pass   # keep the console quiet
+
+
+def serve(port):
+    for p in range(port, port + 10):
+        try:
+            httpd = ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            break
+        except OSError:
+            continue
+    else:
+        sys.exit(f"No free port between {port} and {port + 9}")
+    url = f"http://localhost:{httpd.server_port}/"
+    print(f"\nCourt finder running at {url}\nLeave this window open; press Ctrl+C to stop.\n")
+    webbrowser.open(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -339,6 +424,16 @@ h1{font:700 44px/1 "Barlow Condensed", "Arial Narrow", sans-serif;margin:0;lette
 .seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 button:focus-visible,a:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
 
+.fetchbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin:-6px 0 18px}
+.fetchbar label{font-size:15px;color:var(--muted);display:inline-flex;align-items:center;gap:8px}
+.fetchbar input,.fetchbar select{font:500 15px/1 Barlow, sans-serif;color:var(--ink);background:var(--panel);
+  border:1.5px solid var(--ink);border-radius:8px;padding:7px 10px}
+.btn{font:600 15px/1 Barlow, sans-serif;color:var(--bg);background:var(--ink);border:1.5px solid var(--ink);
+  border-radius:999px;padding:9px 18px;cursor:pointer}
+.btn[disabled]{opacity:.55;cursor:progress}
+input:focus-visible,select:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+body.loading .court,body.loading #list,body.loading .days{opacity:.45;transition:opacity .2s}
+.error{background:var(--panel);border-left:4px solid #B5462F;border-radius:6px;padding:14px 18px;margin-bottom:18px}
 .days{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:18px}
 .days button{flex:0 0 auto;font:600 20px/1 "Barlow Condensed", sans-serif;color:var(--ink);
   background:var(--panel);border:1.5px solid transparent;border-radius:10px;padding:10px 16px 8px;cursor:pointer;text-align:left}
@@ -395,6 +490,20 @@ h2{font:700 28px/1.1 "Barlow Condensed", sans-serif;margin:40px 0 4px}
     </div>
   </header>
 
+  <div class="fetchbar" id="fetchbar" hidden>
+    <label>From <input type="date" id="f-start"></label>
+    <label>Show
+      <select id="f-days">
+        <option value="3">3 days</option>
+        <option value="7" selected>7 days</option>
+        <option value="10">10 days</option>
+        <option value="14">14 days</option>
+      </select>
+    </label>
+    <button type="button" class="btn" id="refresh">Refresh</button>
+  </div>
+  <div id="error"></div>
+
   <div class="days" id="days" role="tablist" aria-label="Day"></div>
 
   <div class="court"><table id="grid"></table></div>
@@ -407,8 +516,10 @@ h2{font:700 28px/1.1 "Barlow Condensed", sans-serif;margin:40px 0 4px}
 </div>
 
 <script>
-const D = __DATA__;
+let D = __DATA__;
+const LIVE = __LIVE__;
 const state = {day: 0, area: "all", min: 60};
+const $ = id => document.getElementById(id);
 
 const pad = n => String(n).padStart(2, "0");
 const fmt = m => pad(Math.floor(m / 60)) + ":" + pad(m % 60);
@@ -435,7 +546,9 @@ function freeHours(day, vis) {
 }
 
 function render() {
+  if (!D) return;
   const vis = visible();
+  state.day = Math.min(state.day, D.days.length - 1);
   const day = D.days[state.day];
 
   segButtons(document.getElementById("area"),
@@ -493,13 +606,80 @@ function render() {
   }
 }
 
-document.getElementById("generated").textContent = "Checked " + D.generated;
-document.getElementById("notes").innerHTML = D.notes.map(n => `<p>${esc(n)}</p>`).join("");
-render();
+function showMeta() {
+  $("generated").textContent = "Checked " + D.generated;
+  $("notes").innerHTML = D.notes.map(n => `<p>${esc(n)}</p>`).join("");
+}
+
+async function load(fresh) {
+  const start = $("f-start").value, days = $("f-days").value;
+  document.body.classList.add("loading");
+  $("refresh").disabled = true;
+  $("refresh").textContent = "Checking…";
+  if (!D) $("generated").textContent = "Checking courts…";
+  try {
+    const r = await fetch(`/api/data?start=${start}&days=${days}${fresh ? "&fresh=1" : ""}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+    D = await r.json();
+    $("error").innerHTML = "";
+    showMeta();
+    render();
+  } catch (e) {
+    $("error").innerHTML = `<div class="error">Couldn't load court data (${esc(e.message)}).
+      Check the court finder window is still running, then press Refresh.</div>`;
+    if (!D) $("generated").textContent = "";
+  } finally {
+    document.body.classList.remove("loading");
+    $("refresh").disabled = false;
+    $("refresh").textContent = "Refresh";
+  }
+}
+
+if (LIVE) {
+  const today = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  $("fetchbar").hidden = false;
+  $("f-start").value = today;
+  $("f-start").min = today;
+  $("refresh").onclick = () => load(true);
+  $("f-start").onchange = () => { state.day = 0; load(false); };
+  $("f-days").onchange = () => load(false);
+  load(false);
+} else {
+  showMeta();
+  render();
+}
 </script>
 </body>
 </html>
 """
+
+
+def collect(venues, start, end, after=0, before=24 * 60):
+    """Fetch every venue in parallel; return (slots, notes)."""
+    now = datetime.now()
+
+    def work(v):
+        fetch, parse, _ = PLATFORMS[v["platform"]]
+        try:
+            slots, seen = parse(v, fetch(v, start, end))
+            return v, slots, seen, None
+        except Exception as e:
+            return v, [], set(), e
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(work, venues))
+
+    all_slots, notes = [], []
+    for v, slots, seen, err in results:
+        if err:
+            notes.append(f"{v['name']}: {err}")
+            continue
+        all_slots += [s for s in slots
+                      if s.start >= after and s.end <= before
+                      and not (s.day == now.date() and s.start < now.hour * 60 + now.minute)]
+        if seen and max(seen) < end:
+            notes.append(f"{v['name']}: nothing released after {max(seen):%a %d %b} yet")
+    return all_slots, notes
 
 
 def court_label(rs):
@@ -551,12 +731,17 @@ def main():
     p.add_argument("--venue", help="only venues whose name contains this text")
     p.add_argument("--debug", metavar="VENUE", help="dump raw data for one venue and exit")
     p.add_argument("--html", action="store_true", help="write courts.html and open it in your browser")
+    p.add_argument("--out", help="where --html writes the page (default courts.html next to the script)")
+    p.add_argument("--no-open", action="store_true", help="with --html, don't open the browser")
+    p.add_argument("--serve", action="store_true", help="run the live page on this computer")
+    p.add_argument("--port", type=int, default=8000, help="port for --serve (default 8000)")
     args = p.parse_args()
 
     days = args.days or (7 if args.html else 1)
     start, end = args.start, args.start + timedelta(days=days - 1)
     after, before = parse_hhmm(args.after), parse_hhmm(args.before)
-    now = datetime.now()
+    if args.serve:
+        return serve(args.port)
 
     if args.debug:
         v = next((v for v in VENUES if args.debug.lower() in v["name"].lower()), None)
@@ -571,37 +756,17 @@ def main():
     if args.venue:
         venues = [v for v in venues if args.venue.lower() in v["name"].lower()]
 
-    def work(v):
-        fetch, parse, _ = PLATFORMS[v["platform"]]
-        try:
-            slots, seen = parse(v, fetch(v, start, end))
-            return v, slots, seen, None
-        except Exception as e:
-            return v, [], set(), e
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(work, venues))
-
-    all_slots, notes = [], []
-    for v, slots, seen, err in results:
-        if err:
-            notes.append(f"{v['name']}: {err}")
-            continue
-        all_slots += [s for s in slots
-                      if s.start >= after and s.end <= before
-                      and not (s.day == now.date() and s.start < now.hour * 60 + now.minute)]
-        if seen and max(seen) < end:
-            notes.append(f"{v['name']}: nothing released after {max(seen):%a %d %b} yet")
-
+    all_slots, notes = collect(venues, start, end, after, before)
     runs = [r for r in merge_runs(all_slots) if r.end - r.start >= args.min]
 
     print(f"\nFree courts {start:%a %d %b} - {end:%a %d %b}, "
           f"{args.after}-{args.before}, {args.min}+ min, area: {args.area}")
     lines = group_runs(runs)
     if args.html:
-        path = write_html(venues, start, end, all_slots, lines, notes)
+        path = write_html(venues, start, end, all_slots, lines, notes, args.out)
         print(f"  Page written to {path}")
-        webbrowser.open(path.as_uri())
+        if not args.no_open:
+            webbrowser.open(path.resolve().as_uri())
     else:
         if not runs:
             print("\n  Nothing found.")
