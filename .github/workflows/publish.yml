@@ -1,0 +1,42 @@
+# Rebuilds the court page every 30 minutes and pushes it to the gh-pages branch.
+# Run it by hand from the Actions tab: "Publish court page" > "Run workflow".
+name: Publish court page
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # every 30 min, off the busy :00/:30 marks
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-courts
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: Europe/London        # so "today" and past-slot filtering use London time
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Fetch courts and build page
+        run: python court_finder.py --build
+
+      - name: Push to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          force_orphan: true      # single commit, so history never piles up
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com

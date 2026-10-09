@@ -9,6 +9,7 @@ Examples:
   py court_finder.py --html                  open a week-ahead page in your browser
   py court_finder.py --serve                 live page with refresh + date controls
   py court_finder.py --publish               fetch, then push the page to GitHub Pages
+  py court_finder.py --build                 build site/index.html only (used by the GitHub workflow)
 
 Better login: if Better refuses anonymous requests, paste your bearer token
 (the long string after "Bearer " in DevTools) into better_token.txt next to
@@ -315,7 +316,7 @@ def build_data(venues, start, end, slots, lines, notes):
             rows.append({"venue": v["name"], "link": LINKS[v["platform"]](v, day), "cells": cells})
         runs = [{"venue": g["venue"], "start": g["start"], "end": g["end"], "price": g["cost"],
                  "label": g["label"], "link": g["link"]} for g in lines if g["day"] == day]
-        days.append({"label": f"{day:%a %d}", "long": f"{day:%A %d %B}", "rows": rows, "runs": runs})
+        days.append({"date": day.isoformat(), "label": f"{day:%a %d}", "long": f"{day:%A %d %B}", "rows": rows, "runs": runs})
 
     data = {
         "generated": datetime.now().strftime("%A %d %B, %H:%M"),
@@ -367,17 +368,39 @@ def git(*args, cwd, check=True):
     return r.stdout.strip()
 
 
-def publish(n_days=7):
+PUBLISH_DAYS = 14   # the page filters this down to 3/7/10/14 in the browser
+
+
+def build_site(n_days=PUBLISH_DAYS):
+    """Fetch everything and write site/index.html. Refuses to write if every venue failed,
+    so a blocked or broken run leaves the last good page online."""
+    start = date.today()
+    end = start + timedelta(days=n_days - 1)
+    slots, notes = collect(VENUES, start, end)
+    errors = [n for n in notes if "nothing released" not in n]
+    if len(errors) >= len(VENUES):
+        raise RuntimeError("every venue failed, not publishing: " + " | ".join(errors))
+    lines = group_runs(merge_runs(slots))
+    write_html(VENUES, start, end, slots, lines, notes, SITE_DIR / "index.html")
+    (SITE_DIR / ".nojekyll").touch()
+    return lines, notes
+
+
+def build(n_days=PUBLISH_DAYS):
+    try:
+        lines, notes = build_site(n_days)
+        log(f"built {len(lines)} runs" + (f"; {len(notes)} notes: " + " | ".join(notes) if notes else ""))
+    except Exception as e:
+        log(f"FAILED: {e}")
+        sys.exit(1)
+
+
+def publish(n_days=PUBLISH_DAYS):
     """Build the page and force-push it as a single commit to the gh-pages branch."""
     here = Path(__file__).parent
     try:
         remote = git("remote", "get-url", "origin", cwd=here)
-        start = date.today()
-        end = start + timedelta(days=n_days - 1)
-        slots, notes = collect(VENUES, start, end)
-        lines = group_runs(merge_runs(slots))
-        write_html(VENUES, start, end, slots, lines, notes, SITE_DIR / "index.html")
-        (SITE_DIR / ".nojekyll").touch()
+        lines, notes = build_site(n_days)
 
         if not (SITE_DIR / ".git").exists():
             git("init", "-q", cwd=SITE_DIR)
@@ -627,11 +650,18 @@ function freeHours(day, vis) {
     .reduce((n, r) => n + Object.values(r.cells).filter(c => c.n > 0).length, 0);
 }
 
+// Live page: the server already sent exactly the range asked for.
+// Published page: everything fetched is baked in, so From/Show just filter it here.
+function viewDays() {
+  if (LIVE) return D.days;
+  const from = $("f-start").value, n = Number($("f-days").value);
+  return D.days.filter(d => !d.date || d.date >= from).slice(0, n);
+}
+
 function render() {
   if (!D) return;
   const vis = visible();
-  state.day = Math.min(state.day, D.days.length - 1);
-  const day = D.days[state.day];
+  const DAYS = viewDays();
 
   segButtons(document.getElementById("area"),
     [["all", "All"], ...Object.entries(D.areas)], "area");
@@ -639,7 +669,17 @@ function render() {
     [[60, "1h+"], [90, "1.5h+"], [120, "2h+"]], "min");
 
   const tabs = document.getElementById("days");
-  tabs.innerHTML = D.days.map((d, i) => {
+  if (!DAYS.length) {
+    tabs.innerHTML = "";
+    $("grid").innerHTML = "";
+    $("list-title").textContent = "";
+    $("list").innerHTML = `<div class="empty">This page doesn't have data for that date yet.
+      Pick an earlier date, or press Refresh in a little while.</div>`;
+    return;
+  }
+  state.day = Math.min(state.day, DAYS.length - 1);
+  const day = DAYS[state.day];
+  tabs.innerHTML = DAYS.map((d, i) => {
     const n = freeHours(d, vis);
     return `<button type="button" role="tab" data-i="${i}" aria-selected="${i === state.day}">
       ${esc(d.label)}<small>${n ? n + " court-hours" : "nothing free"}</small></button>`;
@@ -701,7 +741,7 @@ function showAge() {
   const el = $("generated");
   if (!D.generated_ts) { el.textContent = "Checked " + D.generated; return; }
   const age = Date.now() - D.generated_ts;
-  const stale = !LIVE && age > 90 * 60000;
+  const stale = !LIVE && age > 120 * 60000;   // published page refreshes every 30 min
   el.textContent = `Checked ${D.generated} (${ago(age)})` +
     (stale ? ". This may be out of date, so check the booking site before you go." : "");
   el.classList.toggle("stale", stale);
@@ -737,16 +777,23 @@ async function load(fresh) {
   }
 }
 
+const today = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+$("fetchbar").hidden = false;
+$("f-start").value = today;
+$("f-start").min = today;
 if (LIVE) {
-  const today = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
-  $("fetchbar").hidden = false;
-  $("f-start").value = today;
-  $("f-start").min = today;
   $("refresh").onclick = () => load(true);
   $("f-start").onchange = () => { state.day = 0; load(false); };
   $("f-days").onchange = () => load(false);
   load(false);
 } else {
+  const last = D.days.length ? D.days[D.days.length - 1].date : null;
+  if (last) $("f-start").max = last;
+  // a reload picks up the newest published check
+  $("refresh").title = "Load the latest check (the page updates itself every 30 minutes)";
+  $("refresh").onclick = () => location.reload();
+  $("f-start").onchange = () => { state.day = 0; render(); };
+  $("f-days").onchange = () => render();
   showMeta();
   render();
 }
@@ -838,13 +885,16 @@ def main():
     p.add_argument("--serve", action="store_true", help="run the live page on this computer")
     p.add_argument("--port", type=int, default=8000, help="port for --serve (default 8000)")
     p.add_argument("--publish", action="store_true", help="fetch and push the page to GitHub Pages")
+    p.add_argument("--build", action="store_true", help="only build site/index.html (for the GitHub workflow)")
     args = p.parse_args()
 
     days = args.days or (7 if args.html else 1)
     start, end = args.start, args.start + timedelta(days=days - 1)
     after, before = parse_hhmm(args.after), parse_hhmm(args.before)
+    if args.build:
+        return build(args.days or PUBLISH_DAYS)
     if args.publish:
-        return publish(args.days or 7)
+        return publish(args.days or PUBLISH_DAYS)
     if args.serve:
         return serve(args.port)
 
