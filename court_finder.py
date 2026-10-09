@@ -91,6 +91,19 @@ def days_between(start: date, end: date):
         d += timedelta(days=1)
 
 
+def get_with_retry(url, tries=3, **kw):
+    """GET with a couple of retries for timeouts, dropped connections and 5xx errors."""
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, **kw)
+            if r.status_code < 500 or attempt == tries - 1:
+                return r
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == tries - 1:
+                raise
+        time.sleep(2 * (attempt + 1))
+
+
 # ================================================================ ClubSpark
 def clubspark_link(v, day):
     return f"https://clubspark.lta.org.uk/{v['slug']}/Booking/BookByDate#?date={day.isoformat()}&role=guest"
@@ -100,7 +113,7 @@ def clubspark_fetch(v, start, end):
     out, chunk = [], start
     while chunk <= end:
         chunk_end = min(chunk + timedelta(days=CLUBSPARK_CHUNK_DAYS - 1), end)
-        r = requests.get(
+        r = get_with_retry(
             f"https://clubspark.lta.org.uk/v0/VenueBooking/{v['slug']}/GetVenueSessions",
             params={"resourceID": "", "startDate": chunk.isoformat(), "endDate": chunk_end.isoformat(),
                     "roleId": "", "_": int(time.time() * 1000)},
@@ -175,7 +188,7 @@ def better_link(v, day):
 
 
 def better_get(url, params):
-    r = requests.get(url, params=params, headers=BETTER_HEADERS, timeout=20)
+    r = get_with_retry(url, params=params, headers=BETTER_HEADERS, timeout=20)
     if r.status_code in (401, 403):
         tok = better_token()
         if not tok:
