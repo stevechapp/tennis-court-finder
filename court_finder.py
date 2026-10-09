@@ -33,7 +33,7 @@ from pathlib import Path
 import requests
 
 # ---------------------------------------------------------------- venues
-# areas: "home" = Tottenham side, "irene" = Newington Green side
+# areas: "home" = Tottenham side, "irene" = Newington Green side, "clapton" = east Hackney
 VENUES = [
     # ClubSpark (LTA)
     {"name": "Bruce Castle Park", "platform": "clubspark", "slug": "BruceCastlePark",         "areas": ["home"]},
@@ -41,16 +41,25 @@ VENUES = [
     {"name": "Downhills Park",    "platform": "clubspark", "slug": "DownhillsParkTennisClub", "areas": ["home"]},
     {"name": "Finsbury Park",     "platform": "clubspark", "slug": "FinsburyPark",            "areas": ["home", "irene"]},
     {"name": "Clissold Park",     "platform": "clubspark", "slug": "ClissoldParkHackney",     "areas": ["irene"]},
+    # Added Oct 2026
+    {"name": "Down Lane Park",    "platform": "clubspark", "slug": "DownLanePark",            "areas": ["home"]},
+    {"name": "Priory Park",       "platform": "clubspark", "slug": "PrioryPark2",             "areas": ["home"]},   # Haringey one; 3 and 4 are elsewhere
+    {"name": "Stationers Park",   "platform": "clubspark", "slug": "StationersPark",          "areas": ["home"]},
+    {"name": "Hackney Downs",     "platform": "clubspark", "slug": "HackneyDowns",            "areas": ["irene"]},
+    {"name": "London Fields",     "platform": "clubspark", "slug": "LondonFieldsPark",        "areas": ["irene"]},
+    {"name": "Joe White Gardens", "platform": "clubspark", "slug": "AskeGardens",             "areas": ["irene"]},
+    {"name": "Millfields Park",   "platform": "clubspark", "slug": "MillfieldsParkMiddlesex", "areas": ["clapton"]},
+    {"name": "Spring Hill",       "platform": "clubspark", "slug": "SpringHillParkTennis",    "areas": ["clapton"]},
     # Better (GLL)
     {"name": "Highbury Fields",   "platform": "better", "venue": "islington-tennis-centre",
      "activity": "highbury-tennis",      "areas": ["irene"]},
     {"name": "Islington Tennis Centre (outdoor)", "platform": "better", "venue": "islington-tennis-centre",
      "activity": "tennis-court-outdoor", "areas": ["irene"]},
-    # To add Rosemary Gardens / ITC indoor: open the timetable on bookings.better.org.uk
+    # To add ITC indoor: open the timetable on bookings.better.org.uk
     # and copy the activity slug from the URL (/location/<venue>/<activity>/<date>/...)
 ]
 
-EXCLUDE_COURT_WORDS = ("pickleball", "mini")   # ClubSpark courts to ignore
+EXCLUDE_COURT_WORDS = ("pickleball", "mini", "football")   # ClubSpark resources to ignore
 CLUBSPARK_CHUNK_DAYS = 7
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -129,6 +138,8 @@ def clubspark_fetch(v, start, end):
 def clubspark_parse(v, responses):
     """Category 0 + Capacity > 0 = open window; any other session blocks its time."""
     found, seen_days = {}, set()
+    if not any(data.get("Resources") for data in responses):
+        raise ValueError("ClubSpark returned no courts - slug may be wrong or venue not bookable online")
     for data in responses:
         for res in data.get("Resources", []):
             court = res.get("Name", "?")
@@ -262,7 +273,7 @@ PLATFORMS = {
     "better":    (better_fetch,    better_parse,    better_debug),
 }
 LINKS = {"clubspark": clubspark_link, "better": better_link}
-AREA_NAMES = {"home": "Tottenham", "irene": "Newington Green"}
+AREA_NAMES = {"home": "Tottenham", "irene": "Newington Green", "clapton": "Clapton"}
 
 
 def merge_runs(slots):
@@ -757,7 +768,7 @@ def collect(venues, start, end, after=0, before=24 * 60):
         except Exception as e:
             return v, [], set(), e
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(work, venues))
 
     all_slots, notes = [], []
@@ -818,7 +829,7 @@ def main():
     p.add_argument("--after", default="00:00", help="earliest start, e.g. 17:00")
     p.add_argument("--before", default="23:59", help="latest finish, e.g. 21:00")
     p.add_argument("--min", type=int, default=60, help="minimum continuous minutes (default 60)")
-    p.add_argument("--area", choices=["home", "irene", "all"], default="all")
+    p.add_argument("--area", choices=[*AREA_NAMES, "all"], default="all")
     p.add_argument("--venue", help="only venues whose name contains this text")
     p.add_argument("--debug", metavar="VENUE", help="dump raw data for one venue and exit")
     p.add_argument("--html", action="store_true", help="write courts.html and open it in your browser")
